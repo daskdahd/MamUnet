@@ -8,7 +8,6 @@ This code is directly related to our manuscript submitted to the journal Compute
 
 
 
-Prompt：The complete training code and data set preprocessing script will be updated after the paper is published. Please pay attention to the project update！
 
 ✨ Core Features
 
@@ -55,3 +54,8 @@ Pillow==8.2.0
 h5py==2.10.0
 
 labelme==3.16.7
+
+
+Prompt：
+
+The complete training code and data set preprocessing script will be updated after the paper is published. Please pay attention to the project update！
