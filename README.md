@@ -25,11 +25,15 @@ works(CAHS) is proposed. By deploying horizontally-vertically cascaded convolu
 tions and group-wise independent spatial modeling in the encoder-decoder bridge,
  CAHSenables precise spatial coordinate perception and adaptive weight modulation
  of multi-scale encoder features. 
+
+ 
  • A Cross-Stage Partial Feature Enhancement Layer(CSFEL) is proposed. It incor
 porates progressive multi-block convolutional structures and cross-stage partial
  connection mechanisms. CSFEL conducts hierarchical and progressive information
  enhancement on encoder features across different semantic levels, thereby improv
 ing feature representation capability.
+
+
  • A TransMamba Block network is proposed. Built upon the TransMamba architec
 ture, it performs global sequence dependency modeling and long-range contextual
  information capture on the deepest encoder features. 
