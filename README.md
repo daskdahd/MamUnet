@@ -1,4 +1,4 @@
-![总框架图](https://github.com/user-attachments/assets/5fad7ad0-3134-4a56-8b0b-b52ac7776a48)# MamUnet
+MamUnet
 This code is directly related to our manuscript submitted to the journal Computer Vision. We encourage readers to cite the manuscript when using this code and welcome submissions to Computer Vision.
 Environment Configuration
 环境配置
