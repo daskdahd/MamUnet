@@ -1,576 +1,412 @@
-import colorsys
-import copy
-import time
-
-import cv2
-import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from PIL import Image
-from torch import nn
 
-from nets.unet import Unet as unet
-from utils.utils import cvtColor, preprocess_input, resize_image, show_config
+from nets.resnet import resnet50
+from nets.vgg import VGG16
 
+# 🔥 导入注意力机制
+from atention import CAA, EMA, EfficientAdditiveAttnetion, AFGCAttention, DualDomainSelectionMechanism, AttentionTSSA
+from module.ECA import ECA_layer
+from atention import C2f_IEL
 
-#--------------------------------------------#
-#   使用自己训练好的模型预测需要修改2个参数
-#   model_path和num_classes都需要修改！
-#   如果出现shape不匹配
-#   一定要注意训练时的model_path和num_classes数的修改
-#--------------------------------------------#
-class Unet(object):
-    _defaults = {
-        #-------------------------------------------------------------------#
-        #   model_path指向logs文件夹下的权值文件
-        #   训练好后logs文件夹下存在多个权值文件，选择验证集损失较低的即可。
-        #   验证集损失较低不代表miou较高，仅代表该权值在验证集上泛化性能较好。
-        #-------------------------------------------------------------------#
-        "model_path"    : 'logs/Vid_TransMamba+HSFPN+c2f300/best_epoch_weights.pth',
-        #--------------------------------#
-        #   所需要区分的类的个数+1
-        #--------------------------------#
-        "num_classes"   : 12,
-        #--------------------------------#
-        #   所使用的的主干网络：vgg、resnet50   
-        #--------------------------------#
-        "backbone"      : "resnet50",  # 🔥 改为 resnet50
-        #--------------------------------#
-        #   输入图片的大小
-        #--------------------------------#
-        "input_shape"   : [480,480],
-        #-------------------------------------------------#
-        #   mix_type参数用于控制检测结果的可视化方式
-        #
-        #   mix_type = 0的时候代表原图与生成的图进行混合
-        #   mix_type = 1的时候代表仅保留生成的图
-        #   mix_type = 2的时候代表仅扣去背景，仅保留原图中的目标
-        #-------------------------------------------------#
-        "mix_type"      : 0,
-        #--------------------------------#
-        #   是否使用Cuda
-        #   没有GPU可以设置成False
-        #--------------------------------#
-        "cuda"          : True,
-    }
+# 🔥 导入CAA_HSFPN模块
+from simplified_block import CAA_HSFPN
 
-    #---------------------------------------------------#
-    #   初始化UNET
-    #---------------------------------------------------#
-    def __init__(self, **kwargs):
-        self.__dict__.update(self._defaults)
-        for name, value in kwargs.items():
-            setattr(self, name, value)
-        #---------------------------------------------------#
-        #   画框设置不同的颜色
-        #---------------------------------------------------#
-        if self.num_classes <= 21:
-            # self.colors = [ (128,128,128), (128, 0, 0), (0, 128, 0), (128, 128, 0), (0, 0, 128), (128, 0, 128), (0, 128, 128), 
-            #                 (128, 128, 128), (64, 0, 0), (192, 0, 0), (64, 128, 0), (192, 128, 0), (64, 0, 128), (192, 0, 128), 
-            #                 (64, 128, 128), (192, 128, 128), (0, 64, 0), (128, 64, 0), (0, 192, 0), (128, 192, 0), (0, 64, 128), 
-            #                 (128, 64, 12)]
-            self.colors = [ (128,128,128), (128, 0, 0), ( 128, 64, 128), (0, 0, 192), (64, 64, 128), (128,128,0 ), (64, 0, 128), 
-                           (64, 64, 0), (0, 128, 192), (0, 128, 128), (192, 128, 128),  (0, 0, 0)]
-            # self.colors = [ (0, 0, 0),        # 0=背景/Void (黑色)
-            #                 (0, 0, 255),      # 1=Building (蓝色)
-            #                 (128, 0, 0),      # 2=Tree (红色)
-            #                 (0, 128, 0),      # 3=Sky (绿色)  
-            #                 (128, 128, 0),    # 4=Car (黄色)
-            #                 ]        
-        else:
-            hsv_tuples = [(x / self.num_classes, 1., 1.) for x in range(self.num_classes)]
-            self.colors = list(map(lambda x: colorsys.hsv_to_rgb(*x), hsv_tuples))
-            self.colors = list(map(lambda x: (int(x[0] * 255), int(x[1] * 255), int(x[2] * 255)), self.colors))
-        #---------------------------------------------------#
-        #   获得模型
-        #---------------------------------------------------#
-        self.generate()
+# 定义UNet的上采样模块
+class unetUp(nn.Module):
+    def __init__(self, in_size, out_size, attention_type='none'):
+        super(unetUp, self).__init__()
         
-        show_config(**self._defaults)
+        # 第一个卷积层
+        self.conv1 = nn.Conv2d(in_size, out_size, kernel_size=3, padding=1)
+        # 第二个卷积层
+        self.conv2 = nn.Conv2d(out_size, out_size, kernel_size=3, padding=1)
+        # 上采样操作，放大特征图
+        self.up = nn.UpsamplingBilinear2d(scale_factor=2)
+        self.relu = nn.ReLU(inplace=True)
+        
+        # 🔥 正确计算注意力模块的输入通道数
+        if in_size == 3072:  # up_concat4
+            skip_channels = 1024  # feat4
+            up_channels = 2048    # feat5_up
+        elif in_size == 1024:  # up_concat3
+            skip_channels = 512   # feat3
+            up_channels = 512     # up4
+        elif in_size == 512:   # up_concat2
+            skip_channels = 256   # feat2
+            up_channels = 256     # up3
+        elif in_size == 192:   # up_concat1
+            skip_channels = 64    # feat1
+            up_channels = 128     # up2
+        else:
+            # 🔥 通用计算方式
+            up_channels = out_size * 2
+            skip_channels = in_size - up_channels
+            
+            if skip_channels <= 0:
+                skip_channels = out_size
+                up_channels = in_size - skip_channels
+        
+        # 🔥 添加注意力模块
+        if attention_type != 'none':
+            self.attention = DecoderAttentionModule(
+                skip_channels=skip_channels,
+                up_channels=up_channels,
+                attention_type=attention_type
+            )
+        else:
+            self.attention = None
+            
+        print(f"🔧 unetUp模块: in_size={in_size}, out_size={out_size}, skip_channels={skip_channels}, up_channels={up_channels}, attention={attention_type}")
 
-    #---------------------------------------------------#
-    #   获得所有的分类
-    #---------------------------------------------------#
-    def generate(self, onnx=False):
-        self.net = unet(
-            num_classes=self.num_classes, 
-            backbone=self.backbone,
-            use_caa_hsfpn=True,
-            use_c2f_iel=True,  # 🔥 设置为 False
-            use_transmamba=True,
-            # 🔥 删除 attention_type 和 layer_attentions 参数
+    def forward(self, inputs1, inputs2):
+        # inputs1: 跳跃连接特征
+        # inputs2: 来自下层的特征，需要上采样
+        
+        # 🔥 上采样inputs2
+        up_feat = self.up(inputs2)
+        
+        # 🔥 应用注意力机制（如果有）
+        if self.attention is not None:
+            skip_enhanced, up_enhanced = self.attention(inputs1, up_feat)
+        else:
+            skip_enhanced = inputs1
+            up_enhanced = up_feat
+        
+        # 🔥 拼接增强后的特征
+        outputs = torch.cat([skip_enhanced, up_enhanced], 1)
+        
+        # 🔥 卷积处理
+        outputs = self.conv1(outputs)
+        outputs = self.relu(outputs)
+        outputs = self.conv2(outputs)
+        outputs = self.relu(outputs)
+        
+        return outputs
+
+# 🔥 新增：特征融合模块，将CAA_HSFPN集成到编码器和解码器之间
+class EncoderDecoderBridge(nn.Module):
+    """编码器-解码器桥接模块，使用CAA_HSFPN进行特征融合"""
+    
+    def __init__(self, backbone='resnet50', use_caa_hsfpn=True):
+        super(EncoderDecoderBridge, self).__init__()
+        
+        self.use_caa_hsfpn = use_caa_hsfpn
+        self.backbone = backbone
+        
+        if use_caa_hsfpn:
+            if backbone == 'resnet50':
+                # ResNet50的各层特征通道数：feat1(64), feat2(256), feat3(512), feat4(1024), feat5(2048)
+                self.caa_hsfpn_feat1 = CAA_HSFPN(ch=64, flag=True)    # 最浅层特征
+                self.caa_hsfpn_feat2 = CAA_HSFPN(ch=256, flag=True)   # 第二层特征
+                self.caa_hsfpn_feat3 = CAA_HSFPN(ch=512, flag=True)   # 第三层特征
+                self.caa_hsfpn_feat4 = CAA_HSFPN(ch=1024, flag=True)  # 第四层特征
+                self.caa_hsfpn_feat5 = CAA_HSFPN(ch=2048, flag=True)  # 最深层特征（瓶颈层）
+                
+            elif backbone == 'vgg':
+                # VGG16的各层特征通道数（根据实际VGG实现调整）
+                self.caa_hsfpn_feat1 = CAA_HSFPN(ch=64, flag=True)
+                self.caa_hsfpn_feat2 = CAA_HSFPN(ch=128, flag=True)
+                self.caa_hsfpn_feat3 = CAA_HSFPN(ch=256, flag=True)
+                self.caa_hsfpn_feat4 = CAA_HSFPN(ch=512, flag=True)
+                self.caa_hsfpn_feat5 = CAA_HSFPN(ch=512, flag=True)
+            
+            print(f"🔥 CAA_HSFPN桥接模块已启用 - 骨干网络: {backbone}")
+            print(f"   - 将对所有编码器特征进行空间坐标注意力增强")
+        else:
+            print(f"⚠️ CAA_HSFPN桥接模块已禁用")
+    
+    def forward(self, encoder_features):
+        """
+        对编码器特征应用CAA_HSFPN增强
+        Args:
+            encoder_features: [feat1, feat2, feat3, feat4, feat5] 编码器输出的5层特征
+        Returns:
+            enhanced_features: 增强后的特征列表
+        """
+        feat1, feat2, feat3, feat4, feat5 = encoder_features
+        
+        if self.use_caa_hsfpn:
+            # 🔥 对每层特征应用CAA_HSFPN空间坐标注意力增强
+            feat1_enhanced = self.caa_hsfpn_feat1(feat1)  # 增强浅层特征的空间细节
+            feat2_enhanced = self.caa_hsfpn_feat2(feat2)  # 增强第二层特征
+            feat3_enhanced = self.caa_hsfpn_feat3(feat3)  # 增强第三层特征
+            feat4_enhanced = self.caa_hsfpn_feat4(feat4)  # 增强第四层特征
+            feat5_enhanced = self.caa_hsfpn_feat5(feat5)  # 增强瓶颈层特征的语义表达
+            
+            return [feat1_enhanced, feat2_enhanced, feat3_enhanced, feat4_enhanced, feat5_enhanced]
+        else:
+            # 不使用CAA_HSFPN，直接返回原特征
+            return [feat1, feat2, feat3, feat4, feat5]
+
+# 定义UNet主干网络
+class Unet(nn.Module):
+    def __init__(self, num_classes=9, pretrained=False, backbone='resnet50', 
+                 attention_type='caa', layer_attentions=None, use_c2f_iel=True, 
+                 use_caa_hsfpn=True, use_transmamba=False):  # 🔥 新增参数
+        super(Unet, self).__init__()
+        
+        # 🔥 仅添加这两行保存参数状态
+        self.use_caa_hsfpn = use_caa_hsfpn
+        self.use_c2f_iel = use_c2f_iel
+        self.use_transmamba = use_transmamba
+        # 🔥 处理多层注意力配置
+        if layer_attentions is None:
+            self.layer_attentions = {
+                'up_concat4': 'caa',
+                'up_concat3': 'eca',# 'eca'
+                'up_concat2': 'none',
+                'up_concat1': 'none'
+            }
+        else:
+            self.layer_attentions = {}
+            for layer in ['up_concat4', 'up_concat3', 'up_concat2', 'up_concat1']:
+                self.layer_attentions[layer] = layer_attentions.get(layer, attention_type)
+        
+        print(f"\n🔥 构建增强版多层注意力UNet:")
+        print(f"   骨干网络: {backbone}")
+        print(f"   CAA_HSFPN桥接: {'启用' if use_caa_hsfpn else '禁用'}")
+        print(f"   C2f_IEL增强: {'启用' if use_c2f_iel else '禁用'}")
+        print(f"   TransMamba处理: {'启用' if use_transmamba else '禁用'}")  # 🔥 新增
+        print(f"   解码器注意力配置:")
+        for layer, att_type in self.layer_attentions.items():
+            print(f"     {layer}: {att_type}")
+        
+        # 选择backbone
+        if backbone == 'vgg':
+            self.vgg = VGG16(pretrained=pretrained)
+            in_filters = [192, 384, 768, 1024]  # 各层输入通道数
+        elif backbone == "resnet50":
+            self.resnet = resnet50(pretrained=pretrained, use_transmamba=use_transmamba)  # 🔥 传递参数
+            in_filters = [192, 512, 1024, 3072]
+        else:
+            raise ValueError('Unsupported backbone - `{}`, Use vgg, resnet50.'.format(backbone))
+        
+        out_filters = [64, 128, 256, 512]  # 各层输出通道数
+
+        # 🔥 添加编码器-解码器桥接模块（CAA_HSFPN）
+        self.encoder_decoder_bridge = EncoderDecoderBridge(
+            backbone=backbone, 
+            use_caa_hsfpn=use_caa_hsfpn
         )
 
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        try:
-            self.net.load_state_dict(torch.load(self.model_path, map_location=device), strict=True)
-            print("✅ 权重加载成功")
-        except RuntimeError:
-            print("⚠️ 使用兼容模式...")
-            self.net.load_state_dict(torch.load(self.model_path, map_location=device), strict=False)
-            print("✅ 兼容模式加载完成")
-        
-        self.net = self.net.eval()
-        
-        if not onnx and self.cuda:
-            self.net = nn.DataParallel(self.net)
-            self.net = self.net.cuda()
+        # 🔥 定义四个带注意力的上采样模块
+        self.up_concat4 = unetUp(
+            in_filters[3], out_filters[3], 
+            attention_type=self.layer_attentions['up_concat4']
+        )
+        self.up_concat3 = unetUp(
+            in_filters[2], out_filters[2], 
+            attention_type=self.layer_attentions['up_concat3']
+        )
+        self.up_concat2 = unetUp(
+            in_filters[1], out_filters[1], 
+            attention_type=self.layer_attentions['up_concat2']
+        )
+        self.up_concat1 = unetUp(
+            in_filters[0], out_filters[0], 
+            attention_type=self.layer_attentions['up_concat1']
+        )
 
-    #---------------------------------------------------#
-    #   检测图片
-    #---------------------------------------------------#
-    def detect_image(self, image, count=False, name_classes=None):
-        #---------------------------------------------------------#
-        #   在这里将图像转换成RGB图像，防止灰度图在预测时报错。
-        #   代码仅仅支持RGB图像的预测，所有其它类型的图像都会转化成RGB
-        #---------------------------------------------------------#
-        image       = cvtColor(image)
-        #---------------------------------------------------#
-        #   对输入图像进行一个备份，后面用于绘图
-        #---------------------------------------------------#
-        old_img     = copy.deepcopy(image)
-        orininal_h  = np.array(image).shape[0]
-        orininal_w  = np.array(image).shape[1]
-        #---------------------------------------------------------#
-        #   给图像增加灰条，实现不失真的resize
-        #   也可以直接resize进行识别
-        #---------------------------------------------------------#
-        image_data, nw, nh  = resize_image(image, (self.input_shape[1],self.input_shape[0]))
-        #---------------------------------------------------------#
-        #   添加上batch_size维度
-        #---------------------------------------------------------#
-        image_data  = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, np.float32)), (2, 0, 1)), 0)
-
-        with torch.no_grad():
-            images = torch.from_numpy(image_data)
-            if self.cuda:
-                images = images.cuda()
-                
-            #---------------------------------------------------#
-            #   图片传入网络进行预测
-            #---------------------------------------------------#
-            pr = self.net(images)[0]
-            #---------------------------------------------------#
-            #   取出每一个像素点的种类
-            #---------------------------------------------------#
-            pr = F.softmax(pr.permute(1,2,0),dim = -1).cpu().numpy()
-            #--------------------------------------#
-            #   将灰条部分截取掉
-            #--------------------------------------#
-            pr = pr[int((self.input_shape[0] - nh) // 2) : int((self.input_shape[0] - nh) // 2 + nh), \
-                    int((self.input_shape[1] - nw) // 2) : int((self.input_shape[1] - nw) // 2 + nw)]
-            #---------------------------------------------------#
-            #   进行图片的resize
-            #---------------------------------------------------#
-            pr = cv2.resize(pr, (orininal_w, orininal_h), interpolation = cv2.INTER_LINEAR)
-            #---------------------------------------------------#
-            #   取出每一个像素点的种类
-            #---------------------------------------------------#
-            pr = pr.argmax(axis=-1)
-        
-        #---------------------------------------------------------#
-        #   计数
-        #---------------------------------------------------------#
-        if count:
-            classes_nums        = np.zeros([self.num_classes])
-            total_points_num    = orininal_h * orininal_w
-            print('-' * 63)
-            print("|%25s | %15s | %15s|"%("Key", "Value", "Ratio"))
-            print('-' * 63)
-            for i in range(self.num_classes):
-                num     = np.sum(pr == i)
-                ratio   = num / total_points_num * 100
-                if num > 0:
-                    print("|%25s | %15s | %14.4f%%|"%(str(name_classes[i]), str(num), ratio))
-                    print('-' * 63)
-                classes_nums[i] = num
-            print("classes_nums:", classes_nums)
-
-        if self.mix_type == 0:
-            # seg_img = np.zeros((np.shape(pr)[0], np.shape(pr)[1], 3))
-            # for c in range(self.num_classes):
-            #     seg_img[:, :, 0] += ((pr[:, :] == c ) * self.colors[c][0]).astype('uint8')
-            #     seg_img[:, :, 1] += ((pr[:, :] == c ) * self.colors[c][1]).astype('uint8')
-            #     seg_img[:, :, 2] += ((pr[:, :] == c ) * self.colors[c][2]).astype('uint8')
-            seg_img = np.reshape(np.array(self.colors, np.uint8)[np.reshape(pr, [-1])], [orininal_h, orininal_w, -1])
-            #------------------------------------------------#
-            #   将新图片转换成Image的形式
-            #------------------------------------------------#
-            image   = Image.fromarray(np.uint8(seg_img))
-            #------------------------------------------------#
-            #   将新图与原图及进行混合
-            #------------------------------------------------#
-            image   = Image.blend(old_img, image, 0.7)
-
-        elif self.mix_type == 1:
-            # seg_img = np.zeros((np.shape(pr)[0], np.shape(pr)[1], 3))
-            # for c in range(self.num_classes):
-            #     seg_img[:, :, 0] += ((pr[:, :] == c ) * self.colors[c][0]).astype('uint8')
-            #     seg_img[:, :, 1] += ((pr[:, :] == c ) * self.colors[c][1]).astype('uint8')
-            #     seg_img[:, :, 2] += ((pr[:, :] == c ) * self.colors[c][2]).astype('uint8')
-            seg_img = np.reshape(np.array(self.colors, np.uint8)[np.reshape(pr, [-1])], [orininal_h, orininal_w, -1])
-            #------------------------------------------------#
-            #   将新图片转换成Image的形式
-            #------------------------------------------------#
-            image   = Image.fromarray(np.uint8(seg_img))
-
-        elif self.mix_type == 2:
-            seg_img = (np.expand_dims(pr != 0, -1) * np.array(old_img, np.float32)).astype('uint8')
-            #------------------------------------------------#
-            #   将新图片转换成Image的形式
-            #------------------------------------------------#
-            image = Image.fromarray(np.uint8(seg_img))
-        
-        return image
-
-    def get_FPS(self, image, test_interval):
-        #---------------------------------------------------------#
-        #   在这里将图像转换成RGB图像，防止灰度图在预测时报错。
-        #   代码仅仅支持RGB图像的预测，所有其它类型的图像都会转化成RGB
-        #---------------------------------------------------------#
-        image       = cvtColor(image)
-        #---------------------------------------------------------#
-        #   给图像增加灰条，实现不失真的resize
-        #   也可以直接resize进行识别
-        #---------------------------------------------------------#
-        image_data, nw, nh  = resize_image(image, (self.input_shape[1],self.input_shape[0]))
-        #---------------------------------------------------------#
-        #   添加上batch_size维度
-        #---------------------------------------------------------#
-        image_data  = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, np.float32)), (2, 0, 1)), 0)
-
-        with torch.no_grad():
-            images = torch.from_numpy(image_data)
-            if self.cuda:
-                images = images.cuda()
-                
-            #---------------------------------------------------#
-            #   图片传入网络进行预测
-            #---------------------------------------------------#
-            pr = self.net(images)[0]
-            #---------------------------------------------------#
-            #   取出每一个像素点的种类
-            #---------------------------------------------------#
-            pr = F.softmax(pr.permute(1,2,0),dim = -1).cpu().numpy().argmax(axis=-1)
-            #--------------------------------------#
-            #   将灰条部分截取掉
-            #--------------------------------------#
-            pr = pr[int((self.input_shape[0] - nh) // 2) : int((self.input_shape[0] - nh) // 2 + nh), \
-                    int((self.input_shape[1] - nw) // 2) : int((self.input_shape[1] - nw) // 2 + nw)]
-
-        t1 = time.time()
-        for _ in range(test_interval):
-            with torch.no_grad():
-                #---------------------------------------------------#
-                #   图片传入网络进行预测
-                #---------------------------------------------------#
-                pr = self.net(images)[0]
-                #---------------------------------------------------#
-                #   取出每一个像素点的种类
-                #---------------------------------------------------#
-                pr = F.softmax(pr.permute(1,2,0),dim = -1).cpu().numpy().argmax(axis=-1)
-                #--------------------------------------#
-                #   将灰条部分截取掉
-                #--------------------------------------#
-                pr = pr[int((self.input_shape[0] - nh) // 2) : int((self.input_shape[0] - nh) // 2 + nh), \
-                        int((self.input_shape[1] - nw) // 2) : int((self.input_shape[1] - nw) // 2 + nw)]
-        t2 = time.time()
-        tact_time = (t2 - t1) / test_interval
-        return tact_time
-
-    def convert_to_onnx(self, simplify, model_path):
-        import onnx
-        self.generate(onnx=True)
-
-        im                  = torch.zeros(1, 3, *self.input_shape).to('cpu')  # image size(1, 3, 512, 512) BCHW
-        input_layer_names   = ["images"]
-        output_layer_names  = ["output"]
-        
-        # Export the model
-        print(f'Starting export with onnx {onnx.__version__}.')
-        torch.onnx.export(self.net,
-                        im,
-                        f               = model_path,
-                        verbose         = False,
-                        opset_version   = 12,
-                        training        = torch.onnx.TrainingMode.EVAL,
-                        do_constant_folding = True,
-                        input_names     = input_layer_names,
-                        output_names    = output_layer_names,
-                        dynamic_axes    = None)
-
-        # Checks
-        model_onnx = onnx.load(model_path)  # load onnx model
-        onnx.checker.check_model(model_onnx)  # check onnx model
-
-        # Simplify onnx
-        if simplify:
-            import onnxsim
-            print(f'Simplifying with onnx-simplifier {onnxsim.__version__}.')
-            model_onnx, check = onnxsim.simplify(
-                model_onnx,
-                dynamic_input_shape=False,
-                input_shapes=None)
-            assert check, 'assert check failed'
-            onnx.save(model_onnx, model_path)
-
-        print('Onnx model save as {}'.format(model_path))
-
-    def get_miou_png(self, image):
-        #---------------------------------------------------------#
-        #   在这里将图像转换成RGB图像，防止灰度图在预测时报错。
-        #   代码仅仅支持RGB图像的预测，所有其它类型的图像都会转化成RGB
-        #---------------------------------------------------------#
-        image       = cvtColor(image)
-        orininal_h  = np.array(image).shape[0]
-        orininal_w  = np.array(image).shape[1]
-        #---------------------------------------------------------#
-        #   给图像增加灰条，实现不失真的resize
-        #   也可以直接resize进行识别
-        #---------------------------------------------------------#
-        image_data, nw, nh  = resize_image(image, (self.input_shape[1],self.input_shape[0]))
-        #---------------------------------------------------------#
-        #   添加上batch_size维度
-        #---------------------------------------------------------#
-        image_data  = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, np.float32)), (2, 0, 1)), 0)
-
-        with torch.no_grad():
-            images = torch.from_numpy(image_data)
-            if self.cuda:
-                images = images.cuda()
-                
-            #---------------------------------------------------#
-            #   图片传入网络进行预测
-            #---------------------------------------------------#
-            pr = self.net(images)[0]
-            #---------------------------------------------------#
-            #   取出每一个像素点的种类
-            #---------------------------------------------------#
-            pr = F.softmax(pr.permute(1,2,0),dim = -1).cpu().numpy()
-            #--------------------------------------#
-            #   将灰条部分截取掉
-            #--------------------------------------#
-            pr = pr[int((self.input_shape[0] - nh) // 2) : int((self.input_shape[0] - nh) // 2 + nh), \
-                    int((self.input_shape[1] - nw) // 2) : int((self.input_shape[1] - nw) // 2 + nw)]
-            #---------------------------------------------------#
-            #   进行图片的resize
-            #---------------------------------------------------#
-            pr = cv2.resize(pr, (orininal_w, orininal_h), interpolation = cv2.INTER_LINEAR)
-            #---------------------------------------------------#
-            #   取出每一个像素点的种类
-            #---------------------------------------------------#
-            pr = pr.argmax(axis=-1)
-    
-        image = Image.fromarray(np.uint8(pr))
-        return image
-
-class Unet_ONNX(object):
-    _defaults = {
-        #--------------------------------------------------------------------------#
-        #   onnx_path指向model_data文件夹下的onnx权值文件
-        #-------------------------------------------------------------------#
-        "onnx_path"    : 'model_data/models.onnx',
-        #--------------------------------#
-        #   所需要区分的类的个数+1
-        #--------------------------------#
-        "num_classes"   : 21,
-        #--------------------------------#
-        #   所使用的的主干网络：vgg、resnet50   
-        #--------------------------------#
-        "backbone"      : "vgg",
-        #--------------------------------#
-        #   输入图片的大小
-        #--------------------------------#
-        "input_shape"   : [512, 512],
-        #-------------------------------------------------#
-        #   mix_type参数用于控制检测结果的可视化方式
-        #
-        #   mix_type = 0的时候代表原图与生成的图进行混合
-        #   mix_type = 1的时候代表仅保留生成的图
-        #   mix_type = 2的时候代表仅扣去背景，仅保留原图中的目标
-        #-------------------------------------------------#
-        "mix_type"      : 0,
-    }
-    
-    @classmethod
-    def get_defaults(cls, n):
-        if n in cls._defaults:
-            return cls._defaults[n]
+        # resnet50 backbone下的额外上采样卷积
+        if backbone == 'resnet50':
+            self.up_conv = nn.Sequential(
+                nn.UpsamplingBilinear2d(scale_factor=2), 
+                nn.Conv2d(out_filters[0], out_filters[0], kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(out_filters[0], out_filters[0], kernel_size=3, padding=1),
+                nn.ReLU(),
+            )
         else:
-            return "Unrecognized attribute name '" + n + "'"
+            self.up_conv = None
 
-    #---------------------------------------------------#
-    #   初始化YOLO
-    #---------------------------------------------------#
-    def __init__(self, **kwargs):
-        self.__dict__.update(self._defaults)
-        for name, value in kwargs.items():
-            setattr(self, name, value)
-            self._defaults[name] = value 
+        # 最后一层1x1卷积输出类别数
+        self.final = nn.Conv2d(out_filters[0], num_classes, 1)
+
+        self.backbone = backbone
+
+        # 🔥 添加C2f_IEL特征增强模块（在CAA_HSFPN之后进一步增强）
+        if use_c2f_iel:  # 🔥 改为条件初始化
+            print("🔧 初始化C2f_IEL模块...")
+            if backbone == "resnet50":
+                # ResNet50的特征通道数：feat1(64), feat2(256), feat3(512), feat4(1024)
+                self.c2f_iel_feat1 = C2f_IEL(c1=64, c2=64, n=1, shortcut=False, e=0.5)
+                self.c2f_iel_feat2 = C2f_IEL(c1=256, c2=256, n=2, shortcut=False, e=0.5)  
+                self.c2f_iel_feat3 = C2f_IEL(c1=512, c2=512, n=3, shortcut=False, e=0.5)
+                self.c2f_iel_feat4 = C2f_IEL(c1=1024, c2=1024, n=4, shortcut=False, e=0.5)
+            elif backbone == "vgg":
+                self.c2f_iel_feat1 = C2f_IEL(c1=64, c2=64, n=1, shortcut=False, e=0.5)
+                self.c2f_iel_feat2 = C2f_IEL(c1=128, c2=128, n=1, shortcut=False, e=0.5)  
+                self.c2f_iel_feat3 = C2f_IEL(c1=256, c2=256, n=1, shortcut=False, e=0.5)
+                self.c2f_iel_feat4 = C2f_IEL(c1=512, c2=512, n=1, shortcut=False, e=0.5)
+            print("✅ C2f_IEL模块初始化完成")
+        else:
+            print("⚠️ C2f_IEL模块已禁用")
+            # 🔥 设置为None避免调用错误
+            self.c2f_iel_feat1 = None
+            self.c2f_iel_feat2 = None
+            self.c2f_iel_feat3 = None
+            self.c2f_iel_feat4 = None
+        
+        self.use_c2f_iel = use_c2f_iel
+    
+    def forward(self, inputs):
+        # 🔥 步骤1: 编码器特征提取
+        if self.backbone == "vgg":
+            encoder_features = self.vgg.forward(inputs)
+        elif self.backbone == "resnet50":
+            encoder_features = self.resnet.forward(inputs)
+
+        # 🔥 步骤2: 编码器-解码器桥接（CAA_HSFPN空间坐标注意力增强）
+        enhanced_features = self.encoder_decoder_bridge(encoder_features)
+        feat1_bridge, feat2_bridge, feat3_bridge, feat4_bridge, feat5_bridge = enhanced_features
+
+        # 🔥 步骤3: C2f_IEL进一步特征增强（在前四层）
+        if self.use_c2f_iel:
+            feat1_enhanced = self.c2f_iel_feat1(feat1_bridge)  # 双重增强feat1
+            feat2_enhanced = self.c2f_iel_feat2(feat2_bridge)  # 双重增强feat2  
+            feat3_enhanced = self.c2f_iel_feat3(feat3_bridge)  # 双重增强feat3
+            feat4_enhanced = self.c2f_iel_feat4(feat4_bridge)  # 双重增强feat4
+            feat5_final = feat5_bridge  # feat5仅使用CAA_HSFPN增强
+        else:
+            # 仅使用CAA_HSFPN增强的特征
+            feat1_enhanced = feat1_bridge
+            feat2_enhanced = feat2_bridge
+            feat3_enhanced = feat3_bridge
+            feat4_enhanced = feat4_bridge
+            feat5_final = feat5_bridge
+
+        # 🔥 步骤4: 解码器阶段（使用双重增强后的特征）
+        up4 = self.up_concat4(feat4_enhanced, feat5_final)  # 使用双重增强的feat4
+        up3 = self.up_concat3(feat3_enhanced, up4)          # 使用双重增强的feat3
+        up2 = self.up_concat2(feat2_enhanced, up3)          # 使用双重增强的feat2
+        up1 = self.up_concat1(feat1_enhanced, up2)          # 使用双重增强的feat1
+
+        # resnet50下再上采样一次
+        if self.up_conv != None:
+            up1 = self.up_conv(up1)
+
+        # 输出分割结果
+        final = self.final(up1)
+        
+        return final
+
+    # 冻结backbone参数，不参与训练
+    def freeze_backbone(self):
+        if self.backbone == "vgg":
+            for param in self.vgg.parameters():
+                param.requires_grad = False
+        elif self.backbone == "resnet50":
+            for param in self.resnet.parameters():
+                param.requires_grad = False
+
+    # 解冻backbone参数，参与训练
+    def unfreeze_backbone(self):
+        if self.backbone == "vgg":
+            for param in self.vgg.parameters():
+                param.requires_grad = True
+        elif self.backbone == "resnet50":
+            for param in self.resnet.parameters():
+                param.requires_grad = True
+    
+    def get_attention_summary(self):
+        """获取注意力配置摘要"""
+        summary = self.layer_attentions.copy()
+        summary['caa_hsfpn_bridge'] = hasattr(self, 'encoder_decoder_bridge') and self.encoder_decoder_bridge.use_caa_hsfpn
+        summary['c2f_iel_enhancement'] = self.use_c2f_iel
+        return summary
+
+# 🔥 解码器注意力模块保持不变
+class DecoderAttentionModule(nn.Module):
+    """解码器注意力模块，用于跳跃连接和上采样特征的融合"""
+    
+    def __init__(self, skip_channels, up_channels, attention_type='caa'):
+        super(DecoderAttentionModule, self).__init__()
+        
+        self.attention_type = attention_type
+        self.skip_channels = skip_channels
+        self.up_channels = up_channels
+        
+        if attention_type == 'caa':
+            self.skip_attention = CAA(ch=skip_channels)
+            self.up_attention = CAA(ch=up_channels)
             
-        import onnxruntime
-        self.onnx_session   = onnxruntime.InferenceSession(self.onnx_path)
-        # 获得所有的输入node
-        self.input_name     = self.get_input_name()
-        # 获得所有的输出node
-        self.output_name    = self.get_output_name()
-
-        #---------------------------------------------------#
-        #   画框设置不同的颜色
-        #---------------------------------------------------#
-        if self.num_classes <= 21:
-            self.colors = [ (255, 255, 255), (128, 0, 0), (0, 128, 0), (128, 128, 0), (0, 0, 128), (128, 0, 128), (0, 128, 128), 
-                            (128, 128, 128), (64, 0, 0), (192, 0, 0), (64, 128, 0), (192, 128, 0), (64, 0, 128), (192, 0, 128), 
-                            (64, 128, 128), (192, 128, 128), (0, 64, 0), (128, 64, 0), (0, 192, 0), (128, 192, 0), (0, 64, 128), 
-                            (128, 64, 12)]
+        elif attention_type == 'eca':
+            self.skip_attention = ECA_layer(skip_channels)
+            self.up_attention = ECA_layer(up_channels)
+            
+        elif attention_type == 'ema':
+            self.skip_attention = EMA(channels=skip_channels)
+            self.up_attention = EMA(channels=up_channels)
+            
+        elif attention_type == 'spatial':
+            self.skip_spatial_att = nn.Sequential(
+                nn.Conv2d(skip_channels, max(skip_channels//8, 1), 1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(max(skip_channels//8, 1), 1, 1),
+                nn.Sigmoid()
+            )
+            self.up_spatial_att = nn.Sequential(
+                nn.Conv2d(up_channels, max(up_channels//8, 1), 1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(max(up_channels//8, 1), 1, 1),
+                nn.Sigmoid()
+            )
+            
+        elif attention_type == 'channel':
+            self.skip_channel_att = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Conv2d(skip_channels, max(skip_channels//16, 1), 1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(max(skip_channels//16, 1), skip_channels, 1),
+                nn.Sigmoid()
+            )
+            self.up_channel_att = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Conv2d(up_channels, max(up_channels//16, 1), 1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(max(up_channels//16, 1), up_channels, 1),
+                nn.Sigmoid()
+            )
+            
+        elif attention_type == 'none':
+            pass
+            
         else:
-            hsv_tuples = [(x / self.num_classes, 1., 1.) for x in range(self.num_classes)]
-            self.colors = list(map(lambda x: colorsys.hsv_to_rgb(*x), hsv_tuples))
-            self.colors = list(map(lambda x: (int(x[0] * 255), int(x[1] * 255), int(x[2] * 255)), self.colors))
-
-        show_config(**self._defaults)
-
-    def get_input_name(self):
-        # 获得所有的输入node
-        input_name=[]
-        for node in self.onnx_session.get_inputs():
-            input_name.append(node.name)
-        return input_name
- 
-    def get_output_name(self):
-        # 获得所有的输出node
-        output_name=[]
-        for node in self.onnx_session.get_outputs():
-            output_name.append(node.name)
-        return output_name
- 
-    def get_input_feed(self,image_tensor):
-        # 利用input_name获得输入的tensor
-        input_feed={}
-        for name in self.input_name:
-            input_feed[name]=image_tensor
-        return input_feed
+            print(f"⚠️ 警告: 不支持的注意力类型 '{attention_type}'，将使用无注意力模式")
+            self.attention_type = 'none'
+        
+        if attention_type != 'none':
+            print(f"✅ 解码器注意力模块: {attention_type} (skip:{skip_channels}, up:{up_channels})")
     
-    #---------------------------------------------------#
-    #   对输入图像进行resize
-    #---------------------------------------------------#
-    def resize_image(self, image, size):
-        iw, ih  = image.size
-        w, h    = size
-
-        scale   = min(w/iw, h/ih)
-        nw      = int(iw*scale)
-        nh      = int(ih*scale)
-
-        image   = image.resize((nw,nh), Image.BICUBIC)
-        new_image = Image.new('RGB', size, (128,128,128))
-        new_image.paste(image, ((w-nw)//2, (h-nh)//2))
-
-        return new_image, nw, nh
-
-    #---------------------------------------------------#
-    #   检测图片
-    #---------------------------------------------------#
-    def detect_image(self, image, count=False, name_classes=None):
-        #---------------------------------------------------------#
-        #   在这里将图像转换成RGB图像，防止灰度图在预测时报错。
-        #   代码仅仅支持RGB图像的预测，所有其它类型的图像都会转化成RGB
-        #---------------------------------------------------------#
-        image       = cvtColor(image)
-        #---------------------------------------------------#
-        #   对输入图像进行一个备份，后面用于绘图
-        #---------------------------------------------------#
-        old_img     = copy.deepcopy(image)
-        orininal_h  = np.array(image).shape[0]
-        orininal_w  = np.array(image).shape[1]
-        #---------------------------------------------------------#
-        #   给图像增加灰条，实现不失真的resize
-        #   也可以直接resize进行识别
-        #---------------------------------------------------------#
-        image_data, nw, nh  = resize_image(image, (self.input_shape[1],self.input_shape[0]))
-        #---------------------------------------------------------#
-        #   添加上bawtch_size维度
-        #---------------------------------------------------------#
-        image_data  = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, np.float32)), (2, 0, 1)), 0)
-
-        input_feed  = self.get_input_feed(image_data)
-        pr          = self.onnx_session.run(output_names=self.output_name, input_feed=input_feed)[0][0]
-
-        def softmax(x, axis):
-            x -= np.max(x, axis=axis, keepdims=True)
-            f_x = np.exp(x) / np.sum(np.exp(x), axis=axis, keepdims=True)
-            return f_x
-        print(np.shape(pr))
-        #---------------------------------------------------#
-        #   取出每一个像素点的种类
-        #---------------------------------------------------#
-        pr = softmax(np.transpose(pr, (1, 2, 0)), -1)
-        #--------------------------------------#
-        #   将灰条部分截取掉
-        #--------------------------------------#
-        pr = pr[int((self.input_shape[0] - nh) // 2) : int((self.input_shape[0] - nh) // 2 + nh), \
-                int((self.input_shape[1] - nw) // 2) : int((self.input_shape[1] - nw) // 2 + nw)]
-        #---------------------------------------------------#
-        #   进行图片的resize
-        #---------------------------------------------------#
-        pr = cv2.resize(pr, (orininal_w, orininal_h), interpolation = cv2.INTER_LINEAR)
-        #---------------------------------------------------#
-        #   取出每一个像素点的种类
-        #---------------------------------------------------#
-        pr = pr.argmax(axis=-1)
+    def forward(self, skip_feat, up_feat):
+        if self.attention_type == 'caa':
+            skip_enhanced = self.skip_attention(skip_feat)
+            up_enhanced = self.up_attention(up_feat)
+            
+        elif self.attention_type == 'eca':
+            skip_enhanced = self.skip_attention(skip_feat)
+            up_enhanced = self.up_attention(up_feat)
+            
+        elif self.attention_type == 'ema':
+            skip_enhanced = self.skip_attention(skip_feat)
+            up_enhanced = self.up_attention(up_feat)
+            
+        elif self.attention_type == 'spatial':
+            skip_att = self.skip_spatial_att(skip_feat)
+            up_att = self.up_spatial_att(up_feat)
+            skip_enhanced = skip_feat * skip_att
+            up_enhanced = up_feat * up_att
+            
+        elif self.attention_type == 'channel':
+            skip_att = self.skip_channel_att(skip_feat)
+            up_att = self.up_channel_att(up_feat)
+            skip_enhanced = skip_feat * skip_att
+            up_enhanced = up_feat * up_att
+            
+        else:
+            skip_enhanced = skip_feat
+            up_enhanced = up_feat
         
-        #---------------------------------------------------------#
-        #   计数
-        #---------------------------------------------------------#
-        if count:
-            classes_nums        = np.zeros([self.num_classes])
-            total_points_num    = orininal_h * orininal_w
-            print('-' * 63)
-            print("|%25s | %15s | %15s|"%("Key", "Value", "Ratio"))
-            print('-' * 63)
-            for i in range(self.num_classes):
-                num     = np.sum(pr == i)
-                ratio   = num / total_points_num * 100
-                if num > 0:
-                    print("|%25s | %15s | %14.4f%%|"%(str(name_classes[i]), str(num), ratio))
-                    print('-' * 63)
-                classes_nums[i] = num
-            print("classes_nums:", classes_nums)
-
-        if self.mix_type == 0:
-            # seg_img = np.zeros((np.shape(pr)[0], np.shape(pr)[1], 3))
-            # for c in range(self.num_classes):
-            #     seg_img[:, :, 0] += ((pr[:, :] == c ) * self.colors[c][0]).astype('uint8')
-            #     seg_img[:, :, 1] += ((pr[:, :] == c ) * self.colors[c][1]).astype('uint8')
-            #     seg_img[:, :, 2] += ((pr[:, :] == c ) * self.colors[c][2]).astype('uint8')
-            seg_img = np.reshape(np.array(self.colors, np.uint8)[np.reshape(pr, [-1])], [orininal_h, orininal_w, -1])
-            #------------------------------------------------#
-            #   将新图片转换成Image的形式
-            #------------------------------------------------#
-            image   = Image.fromarray(np.uint8(seg_img))
-            #------------------------------------------------#
-            #   将新图与原图及进行混合
-            #------------------------------------------------#
-            image   = Image.blend(old_img, image, 0.7)
-
-        elif self.mix_type == 1:
-            # seg_img = np.zeros((np.shape(pr)[0], np.shape(pr)[1], 3))
-            # for c in range(self.num_classes):
-            #     seg_img[:, :, 0] += ((pr[:, :] == c ) * self.colors[c][0]).astype('uint8')
-            #     seg_img[:, :, 1] += ((pr[:, :] == c ) * self.colors[c][1]).astype('uint8')
-            #     seg_img[:, :, 2] += ((pr[:, :] == c ) * self.colors[c][2]).astype('uint8')
-            seg_img = np.reshape(np.array(self.colors, np.uint8)[np.reshape(pr, [-1])], [orininal_h, orininal_w, -1])
-            #------------------------------------------------#
-            #   将新图片转换成Image的形式
-            #------------------------------------------------#
-            image   = Image.fromarray(np.uint8(seg_img))
-
-        elif self.mix_type == 2:
-            seg_img = (np.expand_dims(pr != 0, -1) * np.array(old_img, np.float32)).astype('uint8')
-            #------------------------------------------------#
-            #   将新图片转换成Image的形式
-            #------------------------------------------------#
-            image = Image.fromarray(np.uint8(seg_img))
-        
-        return image
+        return skip_enhanced, up_enhanced
