@@ -1,2 +1,17 @@
 # MamUnet
 This code is directly related to our manuscript submitted to the journal Computer Vision. We encourage readers to cite the manuscript when using this code and welcome submissions to Computer Vision.
+Environment Configuration
+环境配置
+torch
+torchvision
+tensorboard
+scipy==1.2.1
+numpy==1.17.0
+matplotlib==3.1.2
+opencv_python==4.1.2.30
+tqdm==4.60.0
+Pillow==8.2.0
+h5py==2.10.0
+labelme==3.16.7
+
+Prompt：The complete training code and data set preprocessing script will be updated after the paper is published. Please pay attention to the project update！
