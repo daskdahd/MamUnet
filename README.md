@@ -15,3 +15,4 @@ h5py==2.10.0
 labelme==3.16.7
 
 Prompt：The complete training code and data set preprocessing script will be updated after the paper is published. Please pay attention to the project update！
+[总框架图.pdf](https://github.com/user-attachments/files/22970013/default.pdf)
