@@ -1,4 +1,4 @@
-# MamUnet
+![总框架图](https://github.com/user-attachments/assets/5fad7ad0-3134-4a56-8b0b-b52ac7776a48)# MamUnet
 This code is directly related to our manuscript submitted to the journal Computer Vision. We encourage readers to cite the manuscript when using this code and welcome submissions to Computer Vision.
 Environment Configuration
 环境配置
@@ -13,6 +13,10 @@ tqdm==4.60.0
 Pillow==8.2.0
 h5py==2.10.0
 labelme==3.16.7
+![总框架图](https://github.com/user-attachments/assets/3c3d4935-f7c5-4400-9046-2f32cd2ffeca)
+
+
+
 
 Prompt：The complete training code and data set preprocessing script will be updated after the paper is published. Please pay attention to the project update！
-[总框架图.pdf](https://github.com/user-attachments/files/22970013/default.pdf)
+
